@@ -1,0 +1,55 @@
+name: Ej K8S desde alumno
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: Región AWS
+        required: true
+        type: string
+        default: us-east-1
+
+      instance_type:
+        description: Tipo EC2
+        required: true
+        type: string
+        default: t3.small
+
+      ssh_cidr_ipv4:
+        description: CIDR origen SSH
+        required: true
+        type: string
+        default: 0.0.0.0/0
+
+      k8s_stack:
+        description: k3s · minikube · none
+        required: true
+        type: choice
+        options:
+          - k3s
+          - minikube
+          - none
+        default: k3s
+
+      provision_dockerhub:
+        description: ¿Provisionar Docker Hub en el cluster? (desmarcar si en clase lo hacen manual)
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  delegar-receta-ea2:
+    uses: asanchezo-duoc/AUY1104-SharedWorkflows/.github/workflows/ea2-provision-k8s-sandbox.yaml@main
+    with:
+      aws_region: ${{ inputs.aws_region }}
+      instance_type: ${{ inputs.instance_type }}
+      ssh_cidr_ipv4: ${{ inputs.ssh_cidr_ipv4 }}
+      k8s_stack: ${{ inputs.k8s_stack }}
+      provision_dockerhub: ${{ inputs.provision_dockerhub }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      EA2_SSH_PRIVATE_KEY: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}

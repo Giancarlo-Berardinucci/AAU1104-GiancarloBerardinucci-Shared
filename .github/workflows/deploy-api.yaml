@@ -1,0 +1,128 @@
+name: Subir la API a Docker Hub (receta reutilizable)
+
+on:
+  # Los repos cliente pasan la IP K3S como input (no hay acceso a vars del caller desde aquí).
+  # Ejemplo en el cliente: with: k3s-server-public-ip: ${{ vars.K3S_SERVER_PUBLIC_IP }}
+  #
+  # Cuando otro repo te “llama” y te pasa nombre de imagen, tag y secretos
+  workflow_call:
+    inputs:
+      image-name:
+        description: Cómo se llamará la imagen en Docker Hub (solo el nombre, sin tu usuario)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta que identifica esta versión (por ejemplo el identificador del commit)
+        required: true
+        type: string
+      k3s-server-public-ip:
+        description: >
+          IP pública del servidor K3S. En el repo cliente suele guardarse como variable
+          de repositorio (p. ej. K3S_SERVER_PUBLIC_IP) y pasarse en el bloque with del uses.
+        required: true
+        type: string
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      EA2_SSH_PRIVATE_KEY:
+        required: true
+
+  workflow_dispatch:
+    inputs:
+      image-name:
+        description: Nombre corto de la imagen (ej. mi-api-academica)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta de esta versión (ej. v1.0.0)
+        required: true
+        type: string
+      k3s-server-public-ip:
+        description: IP pública del servidor K3S (si corres este workflow aquí, pulsa el valor; vía workflow_call suele inyectarse desde vars)
+        required: true
+        type: string
+
+jobs:
+  deps-and-test:
+    name: Dependencies and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 · Descargar el código del repositorio
+        uses: actions/checkout@v4
+        
+      - name: 2 · Instalar dependencias
+        run: npm install
+        
+      - name: 3 · Ejecutar tests
+        run: npm test
+
+  build-and-push:
+    name: Build and push Docker image
+    needs: deps-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 · Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: 2 · Iniciar sesión en Docker Hub con las credenciales en GitHub Secrets
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 3 · Armar la imagen y publicarla en docker hub
+        run: |
+          # Nombre completo en Docker Hub: tu-usuario/nombre-de-la-imagen
+          IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+
+          # Una sola construcción, dos etiquetas: la de esta versión y "latest" (la última)
+          docker build \
+            -t "${IMAGEN_COMPLETA}:${{ inputs.image-tag }}" \
+            -t "${IMAGEN_COMPLETA}:latest" \
+            .
+
+          # Sube al Hub todas las etiquetas que acabamos de crear para esta imagen
+          docker push --all-tags "${IMAGEN_COMPLETA}"
+
+  deploy-to-k8s:
+    name: Deploy to AWS K3S
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: 1 · SSH al servidor K3S
+        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'echo ok'
+
+      - name: Checkout (manifiestos K8s)
+        uses: actions/checkout@v4
+
+      - name: Copiar k8s/ al servidor y aplicar
+        run: |
+          set -euo pipefail
+          test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo rm -rf /tmp/k8s-deploy'
+          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy"
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
+            'sudo k3s kubectl apply -f /tmp/k8s-deploy/'
+
+      - name: 2 · Verificar estado del Rollout (Monitoreo)
+        id: deploy_status
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
+            'sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+
+      - name: 3 · Rollback automático (Ejecución en caso de fallo)
+        if: failure() && steps.deploy_status.outcome == 'failure'
+        run: |
+          echo "::warning:: El despliegue falló. Iniciando Rollback automático al estado anterior estable..."
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
+            'sudo k3s kubectl rollout undo deployment/demo-api && sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+
+      - name: 4 · Verificar pods finales
+        if: always()
+        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo k3s kubectl get pods -o wide'

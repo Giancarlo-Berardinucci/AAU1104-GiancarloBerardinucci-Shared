@@ -161,6 +161,46 @@ jobs:
             SLOT="${TARGET_SLOT}" IMAGE="${IMAGE_FULL}" perl -pe 's/\$\{SLOT\}/$ENV{SLOT}/g; s/\$\{IMAGE\}/$ENV{IMAGE}/g' "${file}" > "rendered-k8s/$(basename "${file}")"
           done
 
+          cat > rendered-k8s/service-preview.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${APP_NAME}-preview
+            labels:
+              app: ${APP_NAME}
+              role: preview
+          spec:
+            type: NodePort
+            selector:
+              app: ${APP_NAME}
+              slot: ${TARGET_SLOT}
+            ports:
+              - name: http
+                port: 3000
+                targetPort: http
+                nodePort: ${PREVIEW_NODE_PORT}
+          EOF
+
+          cat > rendered-k8s/service-live-bootstrap.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${APP_NAME}
+            labels:
+              app: ${APP_NAME}
+              role: live
+          spec:
+            type: NodePort
+            selector:
+              app: ${APP_NAME}
+              slot: ${PREVIOUS_SLOT}
+            ports:
+              - name: http
+                port: 3000
+                targetPort: http
+                nodePort: ${LIVE_NODE_PORT}
+          EOF
+
           test "$(find rendered-k8s -type f | wc -l)" -gt 0 || { echo "::error::No YAML manifests found in ${MANIFEST_DIR}/"; exit 1; }
           if grep -R '\${' rendered-k8s; then
             echo "::error::Unresolved template variables remain in rendered manifests"
@@ -173,7 +213,9 @@ jobs:
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" 'sudo rm -rf /tmp/k8s-deploy && mkdir -p /tmp/k8s-deploy && sudo chown ubuntu:ubuntu /tmp/k8s-deploy'
           scp -o StrictHostKeyChecking=accept-new -r rendered-k8s/. "${K3S_HOST}:/tmp/k8s-deploy/"
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl get namespace ${K8S_NAMESPACE} >/dev/null 2>&1 || sudo k3s kubectl create namespace ${K8S_NAMESPACE}"
-          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/deployment.yaml"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/service-preview.yaml"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} get service ${APP_NAME} >/dev/null 2>&1 || sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/service-live-bootstrap.yaml"
 
       - name: Wait for candidate rollout
         run: |
@@ -201,7 +243,7 @@ jobs:
           set +e
           echo "::warning::Deployment failed. Restoring live Service selector to ${PREVIOUS_SLOT:-blue}."
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} patch service ${APP_NAME} --type merge -p '{\"spec\":{\"selector\":{\"app\":\"${APP_NAME}\",\"slot\":\"${PREVIOUS_SLOT:-blue}\"}}}'"
-          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} rollout undo deployment/${APP_NAME}-${TARGET_SLOT:-green}"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} rollout undo deployment/${APP_NAME}-${TARGET_SLOT:-green} || true"
 
       - name: Show final Kubernetes state
         if: always()

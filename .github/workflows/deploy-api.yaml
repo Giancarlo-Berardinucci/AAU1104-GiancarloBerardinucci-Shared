@@ -19,12 +19,17 @@ on:
         description: Kubernetes namespace where the API will be deployed.
         required: false
         type: string
-        default: default
+        default: orders
       app-name:
-        description: Kubernetes app label and Service base name.
+        description: Kubernetes app label and Deployment base name.
         required: false
         type: string
-        default: demo-api
+        default: orders
+      service-name:
+        description: Kubernetes live Service name.
+        required: false
+        type: string
+        default: orders-svc
       health-path:
         description: HTTP path used by the pipeline and probes to validate health.
         required: false
@@ -113,6 +118,7 @@ jobs:
       LIVE_NODE_PORT: ${{ inputs.live-node-port }}
       MANIFEST_DIR: ${{ inputs.k8s-manifests-dir }}
       PREVIEW_NODE_PORT: ${{ inputs.preview-node-port }}
+      SERVICE_NAME: ${{ inputs.service-name }}
     steps:
       - name: Load SSH key
         uses: webfactory/ssh-agent@v0.9.0
@@ -128,13 +134,12 @@ jobs:
       - name: Select inactive Blue-Green slot
         run: |
           set -euo pipefail
-          CURRENT_SLOT="$(ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} get service ${APP_NAME} -o jsonpath='{.spec.selector.slot}' 2>/dev/null || true")"
+          CURRENT_SLOT="$(ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} get service ${SERVICE_NAME} -o jsonpath='{.spec.selector.version}' 2>/dev/null || true")"
 
           if [ -z "${CURRENT_SLOT}" ]; then
             CURRENT_SLOT="blue"
-          fi
-
-          if [ "${CURRENT_SLOT}" = "blue" ]; then
+            TARGET_SLOT="blue"
+          elif [ "${CURRENT_SLOT}" = "blue" ]; then
             TARGET_SLOT="green"
           else
             TARGET_SLOT="blue"
@@ -158,22 +163,23 @@ jobs:
 
           for file in "${MANIFEST_DIR}"/*.yaml; do
             [ -e "${file}" ] || continue
-            SLOT="${TARGET_SLOT}" IMAGE="${IMAGE_FULL}" perl -pe 's/\$\{SLOT\}/$ENV{SLOT}/g; s/\$\{IMAGE\}/$ENV{IMAGE}/g' "${file}" > "rendered-k8s/$(basename "${file}")"
+            APP_NAME="${APP_NAME}" SERVICE_NAME="${SERVICE_NAME}" SLOT="${TARGET_SLOT}" IMAGE="${IMAGE_FULL}" perl -pe 's/\$\{APP_NAME\}/$ENV{APP_NAME}/g; s/\$\{SERVICE_NAME\}/$ENV{SERVICE_NAME}/g; s/\$\{SLOT\}/$ENV{SLOT}/g; s/\$\{IMAGE\}/$ENV{IMAGE}/g' "${file}" > "rendered-k8s/$(basename "${file}")"
           done
 
           cat > rendered-k8s/service-preview.yaml <<EOF
           apiVersion: v1
           kind: Service
           metadata:
-            name: ${APP_NAME}-preview
+            name: ${SERVICE_NAME}-preview
             labels:
               app: ${APP_NAME}
               role: preview
+              version: ${TARGET_SLOT}
           spec:
             type: NodePort
             selector:
               app: ${APP_NAME}
-              slot: ${TARGET_SLOT}
+              version: ${TARGET_SLOT}
             ports:
               - name: http
                 port: 3000
@@ -185,15 +191,16 @@ jobs:
           apiVersion: v1
           kind: Service
           metadata:
-            name: ${APP_NAME}
+            name: ${SERVICE_NAME}
             labels:
               app: ${APP_NAME}
               role: live
+              version: ${PREVIOUS_SLOT}
           spec:
             type: NodePort
             selector:
               app: ${APP_NAME}
-              slot: ${PREVIOUS_SLOT}
+              version: ${PREVIOUS_SLOT}
             ports:
               - name: http
                 port: 3000
@@ -215,7 +222,7 @@ jobs:
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl get namespace ${K8S_NAMESPACE} >/dev/null 2>&1 || sudo k3s kubectl create namespace ${K8S_NAMESPACE}"
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/deployment.yaml"
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/service-preview.yaml"
-          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} get service ${APP_NAME} >/dev/null 2>&1 || sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/service-live-bootstrap.yaml"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} get service ${SERVICE_NAME} >/dev/null 2>&1 || sudo k3s kubectl -n ${K8S_NAMESPACE} apply -f /tmp/k8s-deploy/service-live-bootstrap.yaml"
 
       - name: Wait for candidate rollout
         run: |
@@ -230,7 +237,7 @@ jobs:
       - name: Promote candidate to live traffic
         run: |
           set -euo pipefail
-          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} patch service ${APP_NAME} --type merge -p '{\"spec\":{\"selector\":{\"app\":\"${APP_NAME}\",\"slot\":\"${TARGET_SLOT}\"}}}'"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} patch service ${SERVICE_NAME} --type merge -p '{\"metadata\":{\"labels\":{\"version\":\"${TARGET_SLOT}\"}},\"spec\":{\"selector\":{\"app\":\"${APP_NAME}\",\"version\":\"${TARGET_SLOT}\"}}}'"
 
       - name: Validate live health after promotion
         run: |
@@ -242,7 +249,7 @@ jobs:
         run: |
           set +e
           echo "::warning::Deployment failed. Restoring live Service selector to ${PREVIOUS_SLOT:-blue}."
-          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} patch service ${APP_NAME} --type merge -p '{\"spec\":{\"selector\":{\"app\":\"${APP_NAME}\",\"slot\":\"${PREVIOUS_SLOT:-blue}\"}}}'"
+          ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} patch service ${SERVICE_NAME} --type merge -p '{\"metadata\":{\"labels\":{\"version\":\"${PREVIOUS_SLOT:-blue}\"}},\"spec\":{\"selector\":{\"app\":\"${APP_NAME}\",\"version\":\"${PREVIOUS_SLOT:-blue}\"}}}'"
           ssh -o StrictHostKeyChecking=accept-new "${K3S_HOST}" "sudo k3s kubectl -n ${K8S_NAMESPACE} rollout undo deployment/${APP_NAME}-${TARGET_SLOT:-green} || true"
 
       - name: Show final Kubernetes state
